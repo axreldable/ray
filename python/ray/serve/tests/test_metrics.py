@@ -144,6 +144,7 @@ def test_serve_metrics_for_successful_connection(metrics_start_shutdown):
             "serve_deployment_processing_latency_ms",
             # gauge
             "serve_replica_processing_queries",
+            "serve_replica_utilization",
             "serve_deployment_replica_healthy",
             # handle
             "serve_handle_request_counter",
@@ -1346,6 +1347,62 @@ def test_routing_stats_error_metric(metrics_start_shutdown):
     print("Timeout error metric verified.")
 
     ray.get(signal.send.remote(clear=True))
+
+
+def test_replica_utilization_metric(metrics_start_shutdown):
+    """Test that replica utilization metric is correctly calculated and exported."""
+
+    @serve.deployment(max_ongoing_requests=4)
+    class SleepDeployment:
+        async def __call__(self, sleep_time: float = 0.1):
+            import asyncio
+
+            await asyncio.sleep(sleep_time)
+            return "done"
+
+    handle = serve.run(SleepDeployment.bind(), name="test_app")
+
+    # Make some requests to generate utilization
+    # With max_ongoing_requests=4 and 4 concurrent requests of 0.5s each,
+    # we should see some utilization
+    from concurrent.futures import ThreadPoolExecutor
+
+    def make_request():
+        return handle.remote(0.5).result()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(make_request) for _ in range(4)]
+        for future in futures:
+            future.result()
+
+    # Wait for metric to be exported
+    def check_utilization_metric_exists():
+        metrics = get_metric_dictionaries("ray_serve_replica_utilization", timeout=5)
+        if len(metrics) == 0:
+            return False
+        # Verify tags
+        assert metrics[0]["deployment"] == "SleepDeployment"
+        assert metrics[0]["application"] == "test_app"
+        # Utilization should be between 0 and 1
+        value = get_metric_float("ray_serve_replica_utilization", timeout=5)
+        assert 0.0 <= value <= 1.0
+        return True
+
+    wait_for_condition(check_utilization_metric_exists, timeout=30)
+    print("Replica utilization metric verified.")
+
+    # Test that utilization is calculated correctly
+    # Send more requests to increase utilization
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(make_request) for _ in range(8)]
+        for future in futures:
+            future.result()
+
+    # Wait and verify utilization is being updated
+    time.sleep(2)
+    final_utilization = get_metric_float("ray_serve_replica_utilization", timeout=5)
+    assert 0.0 <= final_utilization <= 1.0
+    print(f"Final utilization: {final_utilization}")
 
 
 if __name__ == "__main__":

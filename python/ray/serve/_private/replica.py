@@ -299,6 +299,7 @@ class ReplicaMetricsManager:
         event_loop: asyncio.BaseEventLoop,
         autoscaling_config: Optional[AutoscalingConfig],
         ingress: bool,
+        max_ongoing_requests: int,
     ):
         self._replica_id = replica_id
         self._deployment_id = replica_id.deployment_id
@@ -309,8 +310,13 @@ class ReplicaMetricsManager:
             SERVE_CONTROLLER_NAME, namespace=SERVE_NAMESPACE
         )
         self._num_ongoing_requests = 0
+        self._max_ongoing_requests = max_ongoing_requests
         # Store event loop for scheduling async tasks from sync context
         self._event_loop = event_loop or asyncio.get_event_loop()
+
+        # Tracking for replica utilization metric
+        self._total_user_code_time_s = 0.0  # Total seconds spent in user code
+        self._utilization_window_start_time = time.time()  # Window start timestamp
 
         # Cache user_callable_wrapper initialization state to avoid repeated runtime checks
         self._custom_metrics_enabled = False
@@ -363,10 +369,22 @@ class ReplicaMetricsManager:
         if self._cached_metrics_enabled:
             self._cached_latencies = defaultdict(deque)
             self._event_loop.create_task(self._report_cached_metrics_forever())
+        else:
+            # Even when cached metrics are disabled, we need periodic updates for utilization
+            self._event_loop.create_task(self._update_utilization_forever())
 
         self._num_ongoing_requests_gauge = metrics.Gauge(
             "serve_replica_processing_queries",
             description="The current number of queries being processed.",
+        )
+
+        self._replica_utilization_gauge = metrics.Gauge(
+            "serve_replica_utilization",
+            description=(
+                "Fraction of replica concurrency capacity being utilized, "
+                "calculated as total_user_code_time / (wall_clock_duration * max_ongoing_requests). "
+                "Range: 0.0 (idle) to 1.0 (fully saturated)."
+            ),
         )
 
         self.record_autoscaling_stats_failed_counter = metrics.Counter(
@@ -515,6 +533,9 @@ class ReplicaMetricsManager:
 
         self._num_ongoing_requests_gauge.set(self._num_ongoing_requests)
 
+        # Calculate and update replica utilization
+        self._update_replica_utilization()
+
         if not self._is_direct_ingress:
             return
 
@@ -563,6 +584,31 @@ class ReplicaMetricsManager:
         self._cached_deployment_request_error_counter.clear()
         self._cached_ingress_processing_latencies.clear()
 
+    def _update_replica_utilization(self):
+        """Calculate and update the replica utilization gauge.
+
+        Utilization is calculated as:
+            total_user_code_time / (wall_clock_duration * max_ongoing_requests)
+
+        This represents how efficiently the replica is using its configured
+        concurrency capacity. A value of 1.0 means the replica is fully saturated.
+        """
+        current_time = time.time()
+        wall_clock_duration = current_time - self._utilization_window_start_time
+
+        # Avoid division by zero on first call or very short intervals
+        if wall_clock_duration <= 0 or self._max_ongoing_requests <= 0:
+            utilization = 0.0
+        else:
+            max_possible_time = wall_clock_duration * self._max_ongoing_requests
+            utilization = min(1.0, self._total_user_code_time_s / max_possible_time)
+
+        self._replica_utilization_gauge.set(utilization)
+
+        # Reset counters for next measurement window
+        self._total_user_code_time_s = 0.0
+        self._utilization_window_start_time = current_time
+
     async def _report_cached_metrics_forever(self):
         assert self._cached_metrics_interval_s > 0
 
@@ -574,6 +620,25 @@ class ReplicaMetricsManager:
                 consecutive_errors = 0
             except Exception:
                 logger.exception("Unexpected error reporting metrics.")
+
+                # Exponential backoff starting at 1s and capping at 10s.
+                backoff_time_s = min(10, 2**consecutive_errors)
+                consecutive_errors += 1
+                await asyncio.sleep(backoff_time_s)
+
+    async def _update_utilization_forever(self):
+        """Periodically update replica utilization when cached metrics are disabled."""
+        # Use a default interval of 10 seconds when cached metrics are disabled
+        update_interval_s = 10.0
+
+        consecutive_errors = 0
+        while True:
+            try:
+                await asyncio.sleep(update_interval_s)
+                self._update_replica_utilization()
+                consecutive_errors = 0
+            except Exception:
+                logger.exception("Unexpected error updating replica utilization.")
 
                 # Exponential backoff starting at 1s and capping at 10s.
                 backoff_time_s = min(10, 2**consecutive_errors)
@@ -703,6 +768,9 @@ class ReplicaMetricsManager:
 
     def record_request_metrics(self, *, route: str, latency_ms: float, was_error: bool):
         """Records per-request metrics."""
+        # Accumulate user code execution time for utilization calculation
+        self._total_user_code_time_s += latency_ms / 1000.0
+
         if self._cached_metrics_enabled:
             self._cached_latencies[route].append(latency_ms)
             if was_error:
@@ -948,6 +1016,7 @@ class ReplicaBase(ABC):
             event_loop=self._event_loop,
             autoscaling_config=self._deployment_config.autoscaling_config,
             ingress=ingress,
+            max_ongoing_requests=self._deployment_config.max_ongoing_requests,
         )
 
         # Start event loop monitoring for the replica's main event loop.
